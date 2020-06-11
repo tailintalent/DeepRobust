@@ -8,6 +8,26 @@ from torch.nn.modules.module import Module
 from deeprobust.graph import utils
 from copy import deepcopy
 from sklearn.metrics import f1_score
+import pdb
+
+def normalize_adj_tensor(adj, sparse=False):
+    device = adj.device
+    if sparse:
+        # TODO if this is too slow, uncomment the following code,
+        # but you need to install torch_scatter
+        # return normalize_sparse_tensor(adj)
+        adj = utils.to_scipy(adj)
+        mx = utils.normalize_adj(adj)
+        return utils.sparse_mx_to_torch_sparse_tensor(mx).to(device)
+    else:
+        mx = adj + torch.eye(adj.shape[0]).to(device)
+        rowsum = mx.sum(1)
+        r_inv = rowsum.pow(-1/2).flatten()
+        r_inv[torch.isinf(r_inv)] = 0.
+        r_mat_inv = torch.diag(r_inv)
+        mx = r_mat_inv @ mx
+        mx = mx @ r_mat_inv
+    return mx
 
 class GraphConvolution(Module):
     """
@@ -54,7 +74,7 @@ class GraphConvolution(Module):
 
 class GCN(nn.Module):
 
-    def __init__(self, nfeat, nhid, nclass, dropout=0.5, lr=0.01, weight_decay=5e-4, with_relu=True, with_bias=True, device=None):
+    def __init__(self, nfeat, nhid, nclass, dropout=0.5, lr=0.01, weight_decay=5e-4, with_relu=True, with_bias=True, device=None, num_layers=2):
 
         super(GCN, self).__init__()
 
@@ -63,8 +83,11 @@ class GCN(nn.Module):
         self.nfeat = nfeat
         self.hidden_sizes = [nhid]
         self.nclass = nclass
-        self.gc1 = GraphConvolution(nfeat, nhid, with_bias=with_bias)
-        self.gc2 = GraphConvolution(nhid, nclass, with_bias=with_bias)
+        self.num_layers = num_layers
+        for i in range(self.num_layers):
+            setattr(self, "gc%d"%(i+1), GraphConvolution(nfeat if i == 0 else nhid, nclass if i==self.num_layers - 1 else nhid, with_bias=with_bias))
+        # self.gc1 = GraphConvolution(nfeat, nhid, with_bias=with_bias)
+        # self.gc2 = GraphConvolution(nhid, nclass, with_bias=with_bias)
         self.dropout = dropout
         self.lr = lr
         if not with_relu:
@@ -83,18 +106,27 @@ class GCN(nn.Module):
         '''
             adj: normalized adjacency matrix
         '''
-        if self.with_relu:
-            x = F.relu(self.gc1(x, adj))
-        else:
-            x = self.gc1(x, adj)
+        for i in range(self.num_layers):
+            if i > 0:
+                x = F.dropout(x, self.dropout, training=self.training)
+            if self.with_relu and i != self.num_layers - 1:
+                x = F.relu(getattr(self, "gc%d"%(i+1))(x, adj))
+            else:
+                x = getattr(self, "gc%d"%(i+1))(x, adj)
+        # if self.with_relu:
+        #     x = F.relu(self.gc1(x, adj))
+        # else:
+        #     x = self.gc1(x, adj)
 
-        x = F.dropout(x, self.dropout, training=self.training)
-        x = self.gc2(x, adj)
+        # x = F.dropout(x, self.dropout, training=self.training)
+        # x = self.gc2(x, adj)
         return F.log_softmax(x, dim=1)
 
     def initialize(self):
-        self.gc1.reset_parameters()
-        self.gc2.reset_parameters()
+        for i in range(self.num_layers):
+            getattr(self, "gc%d"%(i+1)).reset_parameters()
+        # self.gc1.reset_parameters()
+        # self.gc2.reset_parameters()
 
     def fit(self, features, adj, labels, idx_train, idx_val=None, train_iters=200, initialize=True, verbose=False, normalize=True, patience=500):
         '''
@@ -114,9 +146,9 @@ class GCN(nn.Module):
 
         if normalize:
             if utils.is_sparse_tensor(adj):
-                adj_norm = utils.normalize_adj_tensor(adj, sparse=True)
+                adj_norm = normalize_adj_tensor(adj, sparse=True)
             else:
-                adj_norm = utils.normalize_adj_tensor(adj)
+                adj_norm = normalize_adj_tensor(adj)
         else:
             adj_norm = adj
 
@@ -239,7 +271,7 @@ class GCN(nn.Module):
         print("Test set results:",
               "loss= {:.4f}".format(loss_test.item()),
               "accuracy= {:.4f}".format(acc_test.item()))
-        return acc_test
+        return [loss_test.item(), acc_test.item()]
 
     def _set_parameters():
         # TODO
@@ -257,8 +289,8 @@ class GCN(nn.Module):
 
             self.features = features
             if utils.is_sparse_tensor(adj):
-                self.adj_norm = utils.normalize_adj_tensor(adj, sparse=True)
+                self.adj_norm = normalize_adj_tensor(adj, sparse=True)
             else:
-                self.adj_norm = utils.normalize_adj_tensor(adj)
+                self.adj_norm = normalize_adj_tensor(adj)
             return self.forward(self.features, self.adj_norm)
 

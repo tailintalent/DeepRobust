@@ -4,8 +4,10 @@ import math
 import torch
 from torch.nn.parameter import Parameter
 from torch.nn.modules.module import Module
+import sys, os
+sys.path.append(os.path.join(os.path.dirname("__file__"), '..', '..', '..'))
 from deeprobust.graph import utils
-from deeprobust.graph.defense import GCN
+from GIB.DeepRobust.deeprobust.graph.defense import GCN
 from tqdm import tqdm
 import scipy.sparse as sp
 import numpy as np
@@ -30,29 +32,29 @@ class GCNSVD(GCN):
         super().fit(features, modified_adj, labels, idx_train, idx_val, train_iters=train_iters, initialize=initialize, verbose=verbose)
 
     def truncatedSVD(self, data, k=50):
-        print('=== GCN-SVD: rank={} ==='.format(k))
+        # print('=== GCN-SVD: rank={} ==='.format(k))
         if sp.issparse(data):
             data = data.asfptype()
             U, S, V = sp.linalg.svds(data, k=k)
-            print("rank_after = {}".format(len(S.nonzero()[0])))
+            # print("rank_after = {}".format(len(S.nonzero()[0])))
             diag_S = np.diag(S)
         else:
             U, S, V = np.linalg.svd(data)
             U = U[:, :k]
             S = S[:k]
             V = V[:k, :]
-            print("rank_before = {}".format(len(S.nonzero()[0])))
+            # print("rank_before = {}".format(len(S.nonzero()[0])))
             diag_S = np.diag(S)
-            print("rank_after = {}".format(len(diag_S.nonzero()[0])))
+            # print("rank_after = {}".format(len(diag_S.nonzero()[0])))
 
         return U @ diag_S @ V
 
 
 class GCNJaccard(GCN):
 
-    def __init__(self, nfeat, nhid, nclass, binary_feature=True, dropout=0.5, lr=0.01, weight_decay=5e-4, with_relu=True, with_bias=True, device='cpu'):
+    def __init__(self, nfeat, nhid, nclass, binary_feature=True, dropout=0.5, lr=0.01, weight_decay=5e-4, with_relu=True, with_bias=True, num_layers=2, device='cpu'):
 
-        super(GCNJaccard, self).__init__(nfeat, nhid, nclass, dropout, lr, weight_decay, with_relu, with_bias, device=device)
+        super(GCNJaccard, self).__init__(nfeat, nhid, nclass, dropout, lr, weight_decay, with_relu, with_bias, num_layers=num_layers, device=device)
         self.device = device
         self.binary_feature = binary_feature
 

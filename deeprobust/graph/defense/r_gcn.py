@@ -7,6 +7,7 @@
 
 import torch.nn.functional as F
 import math
+import pdb
 import torch
 from torch.nn.parameter import Parameter
 from torch.nn.modules.module import Module
@@ -63,13 +64,13 @@ class GGCL_D(Module):
     def forward(self, miu, sigma, adj_norm1, adj_norm2, gamma=1):
         miu = F.dropout(miu, self.dropout, training=self.training)
         sigma = F.dropout(sigma, self.dropout, training=self.training)
-        miu = F.elu(miu @ self.weight_miu)
-        sigma = F.relu(sigma @ self.weight_sigma)
+        self.miu = F.elu(miu @ self.weight_miu)
+        self.sigma = F.relu(sigma @ self.weight_sigma)
 
-        Att = torch.exp(-gamma * sigma)
-        mean_out = adj_norm1 @ (miu * Att)
-        sigma_out = adj_norm2 @ (sigma * Att * Att)
-        return mean_out, sigma
+        Att = torch.exp(-gamma * self.sigma)
+        mean_out = adj_norm1 @ (self.miu * Att)
+        sigma_out = adj_norm2 @ (self.sigma * Att * Att)
+        return mean_out, sigma_out
 
 
 class GaussianConvolution(Module):
@@ -117,7 +118,7 @@ class GaussianConvolution(Module):
 
 class RGCN(Module):
 
-    def __init__(self, nnodes, nfeat, nhid, nclass, gamma=1.0, beta1=5e-4, beta2=5e-4, lr=0.01, dropout=0.6, device='cpu'):
+    def __init__(self, nnodes, nfeat, nhid, nclass, gamma=1.0, beta1=5e-4, beta2=5e-4, lr=0.01, dropout=0.6, device='cpu', num_layers=2):
         super(RGCN, self).__init__()
 
         self.device = device
@@ -131,8 +132,11 @@ class RGCN(Module):
         self.nhid = nhid // 2
         # self.gc1 = GaussianConvolution(nfeat, nhid, dropout=dropout)
         # self.gc2 = GaussianConvolution(nhid, nclass, dropout)
-        self.gc1 = GGCL_F(nfeat, nhid, dropout=dropout)
-        self.gc2 = GGCL_D(nhid, nclass, dropout=dropout)
+        self.num_layers = num_layers
+        for i in range(num_layers):
+            setattr(self, "gc{}".format(i + 1), GGCL_F(nfeat, nhid, dropout=dropout) if i == 0 else GGCL_D(nhid, nclass if i == num_layers - 1 else nhid, dropout=dropout))
+            # self.gc1 = GGCL_F(nfeat, nhid, dropout=dropout)
+            # self.gc2 = GGCL_D(nhid, nclass, dropout=dropout)
 
         self.dropout = dropout
         # self.gaussian = MultivariateNormal(torch.zeros(self.nclass), torch.eye(self.nclass))
@@ -143,9 +147,16 @@ class RGCN(Module):
 
     def forward(self):
         features = self.features
-        miu, sigma = self.gc1(features, self.adj_norm1, self.adj_norm2, self.gamma)
-        miu, sigma = self.gc2(miu, sigma, self.adj_norm1, self.adj_norm2, self.gamma)
-        output = miu + self.gaussian.sample().to(self.device) * torch.sqrt(sigma + 1e-8)
+        for i in range(self.num_layers):
+            if i == 0:
+                miu, sigma = getattr(self, "gc{}".format(i + 1))(features, self.adj_norm1, self.adj_norm2, self.gamma)
+            else:
+                miu, sigma = getattr(self, "gc{}".format(i + 1))(miu, sigma, self.adj_norm1, self.adj_norm2, self.gamma)
+        # miu, sigma = self.gc1(features, self.adj_norm1, self.adj_norm2, self.gamma)
+        # miu, sigma = self.gc2(miu, sigma, self.adj_norm1, self.adj_norm2, self.gamma)
+
+        sigma_last = getattr(self, "gc{}".format(self.num_layers)).sigma
+        output = miu + self.gaussian.sample().to(self.device) * torch.sqrt(sigma_last + 1e-8)
         return F.log_softmax(output, dim=1)
 
     def fit(self, features, adj, labels, idx_train, idx_val=None, train_iters=200, verbose=True):
@@ -202,12 +213,16 @@ class RGCN(Module):
             if best_loss_val > loss_val:
                 best_loss_val = loss_val
                 self.output = output
+                weights = deepcopy(self.state_dict())
 
             if acc_val > best_acc_val:
+#                 print ("step", i)
                 best_acc_val = acc_val
                 self.output = output
+                weights = deepcopy(self.state_dict())
 
         print('=== picking the best model according to the performance on validation ===')
+        self.load_state_dict(weights)
 
 
     def test(self, idx_test):
@@ -218,22 +233,29 @@ class RGCN(Module):
         print("Test set results:",
               "loss= {:.4f}".format(loss_test.item()),
               "accuracy= {:.4f}".format(acc_test.item()))
+        return [loss_test.item(), acc_test.item()]
 
     def _loss(self, input, labels):
         loss = F.nll_loss(input, labels)
-        miu1 = self.gc1.miu
-        sigma1 = self.gc1.sigma
+        miu1 = getattr(self, 'gc%d'%(self.num_layers - 1)).miu
+        sigma1 = getattr(self, "gc%d"%(self.num_layers - 1)).sigma
+        # miu1 = self.gc1.miu
+        # sigma1 = self.gc1.sigma
         kl_loss = 0.5 * (miu1.pow(2) + sigma1 - torch.log(1e-8 + sigma1)).mean(1)
         kl_loss = kl_loss.sum()
-        norm2 = torch.norm(self.gc1.weight_miu, 2).pow(2) + \
-                torch.norm(self.gc1.weight_sigma, 2).pow(2)
+        norm2 = torch.norm(getattr(self, "gc%d"%(self.num_layers - 1)).weight_miu, 2).pow(2) + \
+                torch.norm(getattr(self, "gc%d"%(self.num_layers - 1)).weight_sigma, 2).pow(2)
+        # norm2 = torch.norm(self.gc1.weight_miu, 2).pow(2) + \
+        #         torch.norm(self.gc1.weight_sigma, 2).pow(2)
 
         # print(f'gcn_loss: {loss.item()}, kl_loss: {self.beta1 * kl_loss.item()}, norm2: {self.beta2 * norm2.item()}')
         return loss  + self.beta1 * kl_loss + self.beta2 * norm2
 
     def _initialize(self):
-        self.gc1.reset_parameters()
-        self.gc2.reset_parameters()
+        for i in range(self.num_layers):
+            getattr(self, "gc%d"%(i + 1)).reset_parameters()
+        # self.gc1.reset_parameters()
+        # self.gc2.reset_parameters()
 
     def _normalize_adj(self, adj, power=-1/2):
 
@@ -244,3 +266,17 @@ class RGCN(Module):
         D_power = torch.diag(D_power)
         return D_power @ A @ D_power
 
+    def predict(self, features=None, adj=None):
+        '''By default, inputs are unnormalized data'''
+
+        self.eval()
+        if features is None and adj is None:
+            return self.forward()
+        else:
+            if type(adj) is not torch.Tensor:
+                adj, features = utils.to_tensor(adj.todense(), features.todense(), device=self.device)
+
+            self.features = features
+            self.adj_norm1 = self._normalize_adj(adj, power=-1/2)
+            self.adj_norm2 = self._normalize_adj(adj, power=-1)
+            return self.forward()
